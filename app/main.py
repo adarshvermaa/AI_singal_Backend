@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 
 from app.config import get_settings
-from app.api.routes import analyze, exchange, trade, markets, health, ws, webhook
+from app.api.routes import analyze, exchange, trade, markets, health, ws, webhook, telegram
 from app.exchanges.factory import ExchangeFactory
 
 logger = logging.getLogger(__name__)
@@ -57,3 +57,4 @@ app.include_router(exchange.router, prefix="/api/exchange", tags=["Exchange"])
 app.include_router(trade.router, prefix="/api/trade", tags=["Trading"])
 app.include_router(webhook.router, prefix="/api/webhook", tags=["Webhook"])
 app.include_router(ws.router, prefix="/api", tags=["WebSocket"])
+app.include_router(telegram.router, prefix="/api/telegram", tags=["Telegram"])

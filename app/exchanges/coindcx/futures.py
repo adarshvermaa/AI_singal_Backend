@@ -46,9 +46,22 @@ class CoinDCXFutures:
         Order types: limit_order, market_order, stop_limit, stop_market,
                      take_profit_limit, take_profit_market
         """
+        # Standardize futures pair format (e.g. BTCUSDT or BTC/USDT -> B-BTC_USDT)
+        norm_pair = pair.strip().upper()
+        if not norm_pair.startswith('B-') and '_' not in norm_pair:
+            clean = norm_pair.replace('/', '').replace('-', '')
+            if clean.endswith('USDT'):
+                norm_pair = f"B-{clean[:-4]}_USDT"
+            elif clean.endswith('INR'):
+                norm_pair = f"B-{clean[:-3]}_INR"
+        elif '/' in norm_pair:
+            parts = norm_pair.replace('B-', '').split('/')
+            if len(parts) == 2:
+                norm_pair = f"B-{parts[0]}_{parts[1]}"
+
         order_body = {
             'side': side.value,
-            'pair': pair,
+            'pair': norm_pair,
             'order_type': order_type.value,
             'total_quantity': quantity,
             'leverage': str(int(leverage)),

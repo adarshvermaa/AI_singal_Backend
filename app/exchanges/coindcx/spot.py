@@ -45,8 +45,8 @@ class CoinDCXSpot:
         
         market format: "BTCUSDT" (not "B-BTC_USDT")
         """
-        # Convert pair format: "B-BTC_USDT" -> "BTCUSDT"
-        market = pair.split('-', 1)[1].replace('_', '') if '-' in pair else pair
+        # Convert pair format: "B-BTC_USDT" or "BTC/USDT" -> "BTCUSDT"
+        market = pair.replace('B-', '').replace('_', '').replace('/', '').replace('-', '').upper()
 
         body = {
             'side': side.value,

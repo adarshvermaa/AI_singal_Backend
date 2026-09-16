@@ -113,6 +113,11 @@ class TradeLevels(BaseModel):
     risk_reward_ratio: float
     position_size_suggestion: Optional[float] = None  # in quote currency
     leverage_suggestion: Optional[float] = None
+    entry_inr: Optional[float] = None
+    stop_loss_inr: Optional[float] = None
+    take_profit_1_inr: Optional[float] = None
+    take_profit_2_inr: Optional[float] = None
+    take_profit_3_inr: Optional[float] = None
 
 
 class ModelVote(BaseModel):
@@ -125,7 +130,7 @@ class ModelVote(BaseModel):
 
 
 class SignalResult(BaseModel):
-    """The AI signal result."""
+    """The quantitative signal result."""
     direction: SignalDirection
     confidence: float = Field(..., ge=0, le=1)
     model_agreement: str  # "UNANIMOUS", "MAJORITY", "SPLIT"
@@ -139,6 +144,8 @@ class AnalyzeResponse(BaseModel):
     exchange: str
     timestamp: int
     current_price: float
+    current_price_inr: Optional[float] = None
+    inr_rate: Optional[float] = None
     
     # Signal
     signal: SignalResult

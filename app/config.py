@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     coindcx_webhook_url: str = "https://api.coindcx.com/callbacks/v1/derivatives/futures/order/jSsqRkGH5aQDvuD01JLoV1jDo"
     coindcx_webhook_id: str = "d536c102-6568-4f5e-8297-5ef23f194ace"
     
+    # Telegram Bot
+    telegram_bot_token: str = "8978992155:AAF6k9I0k61hYI97TfuuKDVAq_5_pGT7Rf0"
+    telegram_chat_id: str = ""
+    telegram_auto_send: bool = False
+    telegram_min_confidence: float = 0.70
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

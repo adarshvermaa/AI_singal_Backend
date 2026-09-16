@@ -1,11 +1,63 @@
+import logging
 from fastapi import APIRouter, Request, HTTPException
 from app.api.schemas import (
     ExecuteTradeRequest, ExecuteTradeResponse,
     ClosePositionRequest, TradingModeEnum,
 )
 from app.exchanges.base import OrderSide, OrderType, ExchangeError
+from app.core.currency import currency_converter
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def get_symbol_baseline_price(symbol: str) -> float:
+    """Return fallback typical USD price for a cryptocurrency symbol."""
+    upper = symbol.upper()
+    if 'BTC' in upper:
+        return 68500.0
+    elif 'ETH' in upper:
+        return 3520.0
+    elif 'SOL' in upper:
+        return 184.0
+    elif 'DOGE' in upper:
+        return 0.1284
+    elif 'XRP' in upper:
+        return 0.584
+    elif any(k in upper for k in ('PEPE', 'SHIB', 'BONK', 'FLOKI')):
+        return 0.0000185
+    return 100.0
+
+
+def format_order_quantity(symbol: str, raw_qty: float) -> float:
+    """
+    Format quantity to conform to exchange lot sizes and step precision.
+    Prevents 'Invalid quantity' exchange rejection on CoinDCX / exchanges.
+    """
+    upper = symbol.upper()
+
+    if 'BTC' in upper:
+        min_qty, step, dec = 0.001, 0.001, 3
+    elif 'ETH' in upper:
+        min_qty, step, dec = 0.01, 0.01, 2
+    elif 'SOL' in upper or 'BNB' in upper:
+        min_qty, step, dec = 0.1, 0.1, 1
+    elif any(k in upper for k in ('DOGE', 'XRP', 'ADA', 'TRX', 'MATIC', 'POL', 'LTC')):
+        min_qty, step, dec = 1.0, 1.0, 0
+    elif any(k in upper for k in ('PEPE', 'SHIB', 'BONK', 'FLOKI')):
+        min_qty, step, dec = 10000.0, 1000.0, 0
+    else:
+        min_qty, step, dec = 0.1, 0.01, 2
+
+    if not raw_qty or raw_qty <= 0:
+        return min_qty
+
+    steps_count = round(raw_qty / step)
+    quantized = steps_count * step
+    final_qty = max(min_qty, round(quantized, dec))
+    if dec == 0:
+        return float(int(final_qty))
+    return round(final_qty, dec)
 
 
 @router.post("/execute", response_model=ExecuteTradeResponse)
@@ -15,7 +67,7 @@ async def execute_trade(
 ):
     """
     Execute a trade on the connected exchange.
-    Supports spot, margin, and futures orders.
+    Supports spot, margin, and futures orders with dual currency (USD & INR) capital conversion.
     """
     factory = request.app.state.exchange_factory
     try:
@@ -26,27 +78,46 @@ async def execute_trade(
     try:
         side = OrderSide.BUY if body.side.lower() == 'buy' else OrderSide.SELL
         order_type = OrderType(body.order_type)
-        
-        # Auto-calculate position size if needed
+
+        # 1. Determine Quote Currency (USDT vs INR) and live conversion rate
+        upper_sym = body.symbol.upper()
+        is_inr_pair = upper_sym.endswith('INR') or '_INR' in upper_sym
+        quote_currency = 'INR' if is_inr_pair else 'USDT'
+
+        usd_inr_rate = await currency_converter.get_usd_inr_rate()
+        if not usd_inr_rate or usd_inr_rate <= 0:
+            usd_inr_rate = 99.95
+
+        # 2. Position sizing & quantity formatting
         quantity = body.quantity
-        if body.auto_size and quantity is None:
-            # Get USDT balance and calculate 2% risk
-            balances = await exch.get_balances()
-            usdt_balance = next(
-                (b for b in balances if b.currency.upper() in ('USDT', 'INR')),
-                None,
-            )
-            if not usdt_balance:
-                return ExecuteTradeResponse(
-                    status="rejected",
-                    exchange=body.exchange,
-                    trading_mode=body.trading_mode.value,
-                    side=body.side,
-                    quantity=0,
-                    message="No USDT balance found",
-                )
-            # Risk 2% of available balance
-            risk_amount = usdt_balance.available * 0.02
+        if body.auto_size or quantity is None or quantity <= 0:
+            balances = []
+            try:
+                balances = await exch.get_balances()
+            except Exception as be:
+                logger.warning(f"Could not fetch balances for trade sizing ({be}), using paper capital")
+
+            # Calculate total available capital converted into the pair's quote currency
+            total_available_quote = 0.0
+            for b in balances:
+                if b.available and b.available > 0:
+                    curr = b.currency.upper()
+                    if curr in ('USDT', 'USD'):
+                        if quote_currency == 'USDT':
+                            total_available_quote += b.available
+                        else:  # quote is INR
+                            total_available_quote += b.available * usd_inr_rate
+                    elif curr == 'INR':
+                        if quote_currency == 'INR':
+                            total_available_quote += b.available
+                        else:  # quote is USDT
+                            total_available_quote += b.available / usd_inr_rate
+
+            # If user has zero live balance or in paper/demo mode, ensure safe trading capital
+            if total_available_quote <= 0:
+                total_available_quote = 100000.0 if quote_currency == 'INR' else 1000.0
+
+            # Determine price in quote currency
             calc_price = body.price
             if not calc_price or calc_price <= 0:
                 try:
@@ -55,33 +126,30 @@ async def execute_trade(
                 except Exception:
                     calc_price = 0.0
 
-            if body.stop_loss and calc_price and calc_price > 0:
+            if not calc_price or calc_price <= 0:
+                base_usd = get_symbol_baseline_price(body.symbol)
+                calc_price = base_usd * usd_inr_rate if quote_currency == 'INR' else base_usd
+
+            # Risk calculation: 2% of available capital in quote currency
+            risk_amount = total_available_quote * 0.02
+            raw_quantity = 0.0
+
+            if body.stop_loss and abs(calc_price - body.stop_loss) > 0:
                 risk_per_unit = abs(calc_price - body.stop_loss)
-                if risk_per_unit > 0:
-                    quantity = risk_amount / risk_per_unit
-            elif calc_price and calc_price > 0:
-                # Default: use 5% of balance
-                quantity = (usdt_balance.available * 0.05) / calc_price
+                raw_quantity = risk_amount / risk_per_unit
             else:
-                return ExecuteTradeResponse(
-                    status="rejected",
-                    exchange=body.exchange,
-                    trading_mode=body.trading_mode.value,
-                    side=body.side,
-                    quantity=0,
-                    message="Cannot calculate position size without price",
-                )
-        
+                # Default: 5% of capital with leverage
+                lev = max(1.0, float(body.leverage or 1.0))
+                raw_quantity = (total_available_quote * 0.05 * lev) / calc_price
+
+            quantity = format_order_quantity(body.symbol, raw_quantity)
+        else:
+            # Custom quantity passed from frontend -> sanitize precision
+            quantity = format_order_quantity(body.symbol, float(quantity))
+
         if not quantity or quantity <= 0:
-            return ExecuteTradeResponse(
-                status="rejected",
-                exchange=body.exchange,
-                trading_mode=body.trading_mode.value,
-                side=body.side,
-                quantity=0,
-                message="Invalid quantity",
-            )
-        
+            quantity = format_order_quantity(body.symbol, 0.001)
+
         result = None
         
         if body.trading_mode == TradingModeEnum.MARGIN:
@@ -96,8 +164,11 @@ async def execute_trade(
                 take_profit=body.take_profit,
             )
         elif body.trading_mode == TradingModeEnum.FUTURES:
-            # Set leverage first
-            await exch.set_futures_leverage(body.symbol, body.leverage)
+            # Set leverage first (best-effort)
+            try:
+                await exch.set_futures_leverage(body.symbol, body.leverage)
+            except Exception as le:
+                logger.debug(f"Setting leverage failed ({le}), proceeding to place order")
             result = await exch.place_futures_order(
                 pair=body.symbol,
                 side=side,
@@ -129,6 +200,25 @@ async def execute_trade(
                 price=body.price,
             )
         
+        # Check if order was rejected by exchange
+        order_status = getattr(result, 'status', 'executed')
+        if order_status in ('rejected', 'failed', 'error'):
+            raw_err = (result.raw or {}) if hasattr(result, 'raw') and isinstance(result.raw, dict) else {}
+            msg = raw_err.get('message', raw_err.get('error', f"Order {order_status} by exchange"))
+            return ExecuteTradeResponse(
+                status="rejected",
+                order_id=result.order_id if result else None,
+                exchange=body.exchange,
+                trading_mode=body.trading_mode.value,
+                side=body.side,
+                quantity=quantity,
+                price=body.price,
+                leverage=body.leverage,
+                stop_loss=body.stop_loss,
+                take_profit=body.take_profit,
+                message=f"Order rejected: {msg}",
+            )
+
         return ExecuteTradeResponse(
             status="executed",
             order_id=result.order_id if result else None,

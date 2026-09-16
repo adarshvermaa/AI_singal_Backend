@@ -2,6 +2,7 @@ import time
 import logging
 import pandas as pd
 from fastapi import APIRouter, Request, HTTPException
+from app.config import get_settings
 from app.api.schemas import (
     AnalyzeRequest, AnalyzeResponse, SignalResult, SignalDirection,
     TradeLevels, IndicatorValues, ChartOverlays, ChartLevel,
@@ -133,33 +134,46 @@ async def analyze_pair(
         )
         
         # STEP 4: Calculate levels
-        levels = None
-        if signal_result.direction != SignalDirection.HOLD:
-            atr = indicators.atr_14 or (current_price * 0.01)
-            if signal_result.direction == SignalDirection.BUY:
-                sl = current_price - (1.5 * atr)
-                tp1 = current_price + (2.0 * atr)
-                tp2 = current_price + (3.0 * atr)
-                tp3 = current_price + (4.5 * atr)
-            else:  # SELL
-                sl = current_price + (1.5 * atr)
-                tp1 = current_price - (2.0 * atr)
-                tp2 = current_price - (3.0 * atr)
-                tp3 = current_price - (4.5 * atr)
-            
-            risk = abs(current_price - sl)
-            reward = abs(tp1 - current_price)
-            rr = reward / risk if risk > 0 else 0
-            
-            levels = TradeLevels(
-                entry=current_price,
-                stop_loss=round(sl, 2),
-                take_profit_1=round(tp1, 2),
-                take_profit_2=round(tp2, 2),
-                take_profit_3=round(tp3, 2),
-                risk_reward_ratio=round(rr, 2),
-                leverage_suggestion=3.0,
+        from app.core.currency import currency_converter
+        inr_rate = await currency_converter.get_usd_inr_rate()
+        atr = indicators.atr_14 or (current_price * 0.015)
+
+        is_bull_setup = signal_result.direction == SignalDirection.BUY or (
+            signal_result.direction == SignalDirection.HOLD and (
+                (indicators.supertrend_direction == 1) or
+                (signal_result.model_votes and signal_result.model_votes[0].direction == SignalDirection.BUY)
             )
+        )
+
+        if is_bull_setup:
+            sl = current_price - (1.5 * atr)
+            tp1 = current_price + (2.0 * atr)
+            tp2 = current_price + (3.0 * atr)
+            tp3 = current_price + (4.5 * atr)
+        else:  # Bearish setup
+            sl = current_price + (1.5 * atr)
+            tp1 = current_price - (2.0 * atr)
+            tp2 = current_price - (3.0 * atr)
+            tp3 = current_price - (4.5 * atr)
+
+        risk = abs(current_price - sl)
+        reward = abs(tp1 - current_price)
+        rr = reward / risk if risk > 0 else 0
+
+        levels = TradeLevels(
+            entry=round(current_price, 2),
+            stop_loss=round(sl, 2),
+            take_profit_1=round(tp1, 2),
+            take_profit_2=round(tp2, 2),
+            take_profit_3=round(tp3, 2),
+            risk_reward_ratio=round(rr, 2),
+            leverage_suggestion=3.0,
+            entry_inr=round(current_price * inr_rate, 2),
+            stop_loss_inr=round(sl * inr_rate, 2),
+            take_profit_1_inr=round(tp1 * inr_rate, 2),
+            take_profit_2_inr=round(tp2 * inr_rate, 2),
+            take_profit_3_inr=round(tp3 * inr_rate, 2),
+        )
         
         # STEP 5: Build chart overlays
         overlays = ChartOverlays()
@@ -186,6 +200,35 @@ async def analyze_pair(
                     )
                 )
         
+        # STEP 5.5: Automated Telegram Broadcast (if enabled & confident)
+        settings = get_settings()
+        if (
+            settings.telegram_auto_send
+            and settings.telegram_chat_id
+            and signal_result.direction != SignalDirection.HOLD
+            and signal_result.confidence >= settings.telegram_min_confidence
+        ):
+            import asyncio
+            from app.core.telegram_service import telegram_service
+            asyncio.create_task(
+                telegram_service.send_signal_message(
+                    chat_id=settings.telegram_chat_id,
+                    symbol=body.symbol,
+                    direction=signal_result.direction.value,
+                    price=current_price,
+                    confidence=signal_result.confidence,
+                    sl=levels.stop_loss if levels else None,
+                    tp1=levels.take_profit_1 if levels else None,
+                    tp2=levels.take_profit_2 if levels else None,
+                    tp3=levels.take_profit_3 if levels else None,
+                    timeframe=body.timeframe,
+                    trading_mode=body.trading_mode.value,
+                    model_agreement=signal_result.model_agreement,
+                    rsi=indicators.rsi_14,
+                    regime=signal_gen.get_market_regime(),
+                )
+            )
+
         # STEP 6: Build response
         return AnalyzeResponse(
             symbol=body.symbol,
@@ -193,6 +236,8 @@ async def analyze_pair(
             exchange=body.exchange,
             timestamp=int(time.time() * 1000),
             current_price=current_price,
+            current_price_inr=round(current_price * inr_rate, 2),
+            inr_rate=round(inr_rate, 2),
             signal=signal_result,
             levels=levels,
             reasoning=signal_gen.get_reasoning(),

@@ -46,7 +46,8 @@ class CoinDCXMargin:
         Supports: limit_order, market_order, stop_limit, take_profit
         ecode must be 'B' for all margin orders.
         """
-        market = pair.split('-', 1)[1].replace('_', '') if '-' in pair else pair
+        # Convert pair format: "B-BTC_USDT" or "BTC/USDT" -> "BTCUSDT"
+        market = pair.replace('B-', '').replace('_', '').replace('/', '').replace('-', '').upper()
 
         body = {
             'side': side.value,
